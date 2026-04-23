@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/fsnotify/fsnotify"
@@ -410,7 +411,13 @@ func StartBwrap(conf Config, flatpakMetadata FlatpakMetadata) (bwrap Bwrap) {
 	bwrapArgs = append(bwrapArgs, conf.AppArgs...)
 
 	cmd := exec.Command(conf.BwrapExe, bwrapArgs...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Inherit the launcher's process group instead of creating a new one.
+	// With Setpgid:true, bwrap landed in its own pgroup but the launcher
+	// never called tcsetpgrp() to hand it the tty, so bwrap's children
+	// (e.g. an interactive nvim) were background w.r.t. the terminal and
+	// got SIGTTIN'd on first tty read whenever --new-session was off. Keep
+	// the children in the launcher's pgroup, which is the shell's
+	// foreground pgroup, so tty I/O and SIGWINCH both work.
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -647,7 +654,43 @@ func (f *FlatpakMetadata) Cleanup() {
 	os.RemoveAll(f.MetadataDirectory)
 }
 
+// preflightTIOCSTI refuses to launch when the caller is on a tty and the
+// kernel's TIOCSTI gate is off. The launcher's Setpgid was dropped (so an
+// interactive sandboxed app isn't SIGTTIN'd under newSession=false), which
+// means --new-session can be omitted — but --new-session was also the only
+// thing historically blocking CVE-2017-5226 (TIOCSTI input injection into
+// the parent shell). On Linux 6.2+ the kernel gates TIOCSTI behind the
+// `dev.tty.legacy_tiocsti` sysctl (must be 0). Enforce that here so the
+// sandbox can't silently run without either layer of protection. Skipped
+// when stdin isn't a tty (GUI/desktop launches have no tty, so no TIOCSTI
+// attack surface).
+func preflightTIOCSTI() {
+	if _, err := unix.IoctlGetTermios(int(os.Stdin.Fd()), unix.TCGETS); err != nil {
+		return
+	}
+	data, err := os.ReadFile("/proc/sys/dev/tty/legacy_tiocsti")
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"nixpak: refusing to launch — cannot read /proc/sys/dev/tty/legacy_tiocsti (%v).\n"+
+				"This sandbox launcher omits bwrap's --new-session and relies on kernel-level\n"+
+				"TIOCSTI gating (Linux 6.2+, CONFIG_LEGACY_TIOCSTI=n) to block CVE-2017-5226.\n"+
+				"Upgrade the kernel, or re-enable newSession in the nixpak config.\n", err)
+		os.Exit(1)
+	}
+	if v := strings.TrimSpace(string(data)); v != "0" {
+		fmt.Fprintf(os.Stderr,
+			"nixpak: refusing to launch — dev.tty.legacy_tiocsti = %q (expected 0).\n"+
+				"TIOCSTI input injection (CVE-2017-5226) is not blocked by the kernel, and\n"+
+				"this launcher omits bwrap's --new-session. Fix by running:\n"+
+				"    sudo sysctl dev.tty.legacy_tiocsti=0\n"+
+				"or re-enable newSession in the nixpak config.\n", v)
+		os.Exit(1)
+	}
+}
+
 func run() error {
+	preflightTIOCSTI()
+
 	reaper := StartChildReaper()
 	defer reaper.Close()
 	defer reaper.WaitAndReapAllChildren()
