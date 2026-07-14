@@ -6,7 +6,7 @@ let
     type = types.bool;
     description = "Whether to mount ${desc}.";
   };
-  
+
   pairOf = elemType: with types; let
     list = nonEmptyListOf elemType;
     checked = addCheck list (l: length l == 2);
@@ -108,7 +108,7 @@ in {
       ++ (optional cfg.wayland (sloth.concat [sloth.runtimeDir "/" (sloth.envOr "WAYLAND_DISPLAY" "wayland-0")]))
       ++ (optional cfg.pipewire (sloth.concat' sloth.runtimeDir "/pipewire-0"))
       ++ (optionals cfg.x11 [
-        (sloth.env "XAUTHORITY")
+        (sloth.envOr "XAUTHORITY" (sloth.concat' sloth.homeDir "/.Xauthority"))
         "/tmp/.X11-unix"
       ])
       ++ (optional cfg.pulse (sloth.concat' sloth.runtimeDir "/pulse"));
